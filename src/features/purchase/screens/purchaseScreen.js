@@ -24,7 +24,7 @@ const pickFileWeb = () =>
     new Promise((resolve) => {
         const input = document.createElement('input');
         input.type = 'file';
-        input.accept = 'image/jpeg,image/png,image/webp,image/heic,application/pdf';
+        input.accept = 'image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif,application/pdf,image/*';
         input.onchange = (e) => {
             const file = e.target.files?.[0] ?? null;
             resolve(file);
@@ -207,11 +207,23 @@ export default function PurchaseScreen({ route, navigation }) {
     const [searchQuery, setSearchQuery] = useState('');
     const [filterDate, setFilterDate] = useState('');
 
+    // Draft Step 1 modal state
+    const [draftModalVisible, setDraftModalVisible] = useState(false);
+    const [draftLoading, setDraftLoading] = useState(false);
+    const [draftSelectedFile, setDraftSelectedFile] = useState(null);
+    const [draftForm, setDraftForm] = useState({
+        supplier_name: '',
+        bill_no: '',
+        bill_date: '',
+        notes: '',
+    });
+
     // Upload state
     const [uploading, setUploading] = useState(false);
     const [uploadProgress, setUploadProgress] = useState('');
     const [uploadSuccessModalVisible, setUploadSuccessModalVisible] = useState(false);
     const [autoImportNoticeVisible, setAutoImportNoticeVisible] = useState(false);
+    const [underWorkModalVisible, setUnderWorkModalVisible] = useState(false);
     const [uploadHints, setUploadHints] = useState({ supplier_name: '', bill_date: '', total_amount: '' });
 
     // Preview modal
@@ -232,6 +244,8 @@ export default function PurchaseScreen({ route, navigation }) {
         cgst_amount: 0,
         sgst_amount: 0,
         total_amount: 0,
+        purchase_id: null,
+        bill_image_url: null,
     });
 
     // Delete confirm
@@ -412,6 +426,107 @@ export default function PurchaseScreen({ route, navigation }) {
         });
     };
 
+    const handleOpenAddPurchase = () => {
+        const today = new Date().toISOString().split('T')[0];
+        setDraftForm({
+            supplier_name: '',
+            bill_no: '',
+            bill_date: today,
+            notes: '',
+        });
+        setDraftSelectedFile(null);
+        setDraftModalVisible(true);
+    };
+
+    const handlePickDraftFile = async () => {
+        const file = await pickFileWeb();
+        if (file) {
+            setDraftSelectedFile(file);
+        }
+    };
+
+    const handleSaveDraft = async () => {
+        setDraftLoading(true);
+        try {
+            if (draftSelectedFile) {
+                const formData = new FormData();
+                formData.append('bill', draftSelectedFile, draftSelectedFile.name);
+                if (draftForm.supplier_name) formData.append('supplier_name', draftForm.supplier_name);
+                if (draftForm.bill_no) formData.append('bill_no', draftForm.bill_no);
+                if (draftForm.bill_date) formData.append('bill_date', draftForm.bill_date);
+                if (draftForm.notes) formData.append('notes', draftForm.notes);
+                formData.append('status', 'draft');
+                formData.append('source', 'manual');
+
+                await uploadPurchaseBill(formData);
+            } else {
+                await createPurchaseDraft({
+                    ...draftForm,
+                    status: 'draft',
+                    source: 'manual',
+                });
+            }
+
+            Alert.alert('Draft Saved', 'Purchase record saved as draft! You can complete inventory entry anytime from Purchase Records.');
+            setDraftModalVisible(false);
+            setDraftSelectedFile(null);
+            setDraftForm({ supplier_name: '', bill_no: '', bill_date: '', notes: '' });
+            await fetchPurchases();
+        } catch (err) {
+            console.error('Save draft error:', err);
+            Alert.alert('Draft Error', err?.message || 'Could not save purchase draft.');
+        } finally {
+            setDraftLoading(false);
+        }
+    };
+
+    const handleDirectFullPurchase = () => {
+        setDraftModalVisible(false);
+        setManualPurchaseForm({
+            supplier_name: draftForm.supplier_name || '',
+            supplier_gstin: '',
+            bill_no: draftForm.bill_no || '',
+            bill_date: draftForm.bill_date || '',
+            notes: draftForm.notes || '',
+            items: [],
+            taxable_amount: 0,
+            cgst_amount: 0,
+            sgst_amount: 0,
+            total_amount: 0,
+            purchase_id: null,
+            bill_image_url: null,
+        });
+        setManualPurchaseModalVisible(true);
+    };
+
+    const handleOpenDraft = (item) => {
+        setManualPurchaseForm({
+            supplier_name: item.supplier_name || '',
+            supplier_gstin: item.supplier_gstin || '',
+            bill_no: item.bill_no || '',
+            bill_date: item.bill_date ? item.bill_date.split('T')[0] : '',
+            notes: item.notes || '',
+            items: item.extracted_items && item.extracted_items.length > 0 ? item.extracted_items.map(i => ({
+                medicine_name: i.medicine_name || i.product_name || '',
+                mrp: String(i.mrp || ''),
+                quantity: String(i.quantity || ''),
+                batch_number: i.batch_number || '',
+                expiry_date: i.expiry_date || '',
+                hsn_code: i.hsn_code || '',
+                gst: String(i.gst || ''),
+                rate: String(i.rate || i.cost_price || ''),
+                discount: String(i.discount || '0'),
+            })) : [],
+            taxable_amount: item.taxable_amount || 0,
+            cgst_amount: item.cgst_amount || 0,
+            sgst_amount: item.sgst_amount || 0,
+            total_amount: item.total_amount || 0,
+            purchase_id: item._id,
+            bill_image_url: item.bill_image_url || null,
+        });
+        setManualPurchaseModalVisible(true);
+    };
+
     const handleSaveManualPurchase = async () => {
         if (!manualPurchaseForm.supplier_name.trim()) {
             Alert.alert('Validation Error', 'Supplier Name is required.');
@@ -438,9 +553,7 @@ export default function PurchaseScreen({ route, navigation }) {
                     if (parts.length === 2 && parts[0].length === 2 && parts[1].length === 2) {
                         const month = parseInt(parts[0], 10);
                         const year = 2000 + parseInt(parts[1], 10);
-                        // Get the last day of the month (month is 1-based here, so passing it to Date as monthIndex gets the 0th day of the NEXT month, i.e., last day of current month)
                         const lastDay = new Date(year, month, 0).getDate();
-                        // Format to YYYY-MM-DD so Mongoose parses it reliably
                         formattedExpiry = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
                     }
                 }
@@ -453,6 +566,7 @@ export default function PurchaseScreen({ route, navigation }) {
             setManualPurchaseForm({
                 supplier_name: '', supplier_gstin: '', bill_no: '', bill_date: '', notes: '',
                 items: [], taxable_amount: 0, cgst_amount: 0, sgst_amount: 0, total_amount: 0,
+                purchase_id: null, bill_image_url: null,
             });
             fetchPurchases();
         } catch (error) {
@@ -463,8 +577,7 @@ export default function PurchaseScreen({ route, navigation }) {
     };
 
     const handleUploadBill = () => {
-        setUploadHints({ supplier_name: '', bill_date: '', total_amount: '' });
-        setAutoImportNoticeVisible(true);
+        setUnderWorkModalVisible(true);
     };
 
     const confirmUploadBill = async () => {
@@ -659,7 +772,20 @@ export default function PurchaseScreen({ route, navigation }) {
                             <Text style={styles.noBillText}>No Bill</Text>
                         </View>
                     )}
-                    {(item.status === 'pending' && item.source === 'auto_import' && item.needs_manual_review) ? (
+                    {item.status === 'draft' ? (
+                        <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
+                            <TouchableOpacity style={[styles.btnPrimary, { height: 28, paddingHorizontal: 10, backgroundColor: '#D97706' }]} onPress={() => handleOpenDraft(item)}>
+                                <Text style={styles.btnPrimaryText}>Complete Purchase</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                                style={[styles.actionBtn, styles.actionBtnDanger]}
+                                onPress={() => confirmDelete(item._id)}
+                                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                            >
+                                <Ionicons name="trash-outline" size={13} color={COLORS.error} />
+                            </TouchableOpacity>
+                        </View>
+                    ) : (item.status === 'pending' && item.source === 'auto_import' && item.needs_manual_review) ? (
                         <TouchableOpacity style={[styles.btnPrimary, {height: 28, paddingHorizontal: 10}]} onPress={() => handleOpenReview(item)}>
                             <Text style={styles.btnPrimaryText}>Ready for Review</Text>
                         </TouchableOpacity>
@@ -746,7 +872,20 @@ export default function PurchaseScreen({ route, navigation }) {
                 </View>
                 {/* Actions */}
                 <View style={[styles.cell, { flex: 0.8, alignItems: 'center', borderRightWidth: 0, flexDirection: 'row', justifyContent: 'center', gap: 6 }]}>
-                    {(item.status === 'pending' && item.source === 'auto_import' && item.needs_manual_review) ? (
+                    {item.status === 'draft' ? (
+                        <View style={{ flexDirection: 'row', gap: 4 }}>
+                            <TouchableOpacity style={[styles.btnPrimary, { height: 26, paddingHorizontal: 8, backgroundColor: '#D97706' }]} onPress={() => handleOpenDraft(item)}>
+                                <Text style={[styles.btnPrimaryText, { fontSize: 10 }]}>Complete</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                                style={[styles.actionBtn, styles.actionBtnDanger]}
+                                onPress={() => confirmDelete(item._id)}
+                                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                            >
+                                <Ionicons name="trash-outline" size={13} color={COLORS.error} />
+                            </TouchableOpacity>
+                        </View>
+                    ) : (item.status === 'pending' && item.source === 'auto_import' && item.needs_manual_review) ? (
                         <TouchableOpacity style={[styles.btnPrimary, {height: 26, paddingHorizontal: 8}]} onPress={() => handleOpenReview(item)}>
                             <Text style={[styles.btnPrimaryText, {fontSize: 10}]}>Review</Text>
                         </TouchableOpacity>
@@ -789,7 +928,7 @@ export default function PurchaseScreen({ route, navigation }) {
 
                         <TouchableOpacity
                             style={[styles.btnSecondary, r.isSmall && { height: 38 }]}
-                            onPress={() => setManualPurchaseModalVisible(true)}
+                            onPress={handleOpenAddPurchase}
                         >
                             <Ionicons name="add-circle-outline" size={14} color={COLORS.primary} style={{ marginRight: 6 }} />
                             <Text style={[styles.btnSecondaryText, { color: COLORS.primary }]}>Add Purchase</Text>
@@ -995,6 +1134,29 @@ export default function PurchaseScreen({ route, navigation }) {
                 </View>
             </Modal>
 
+            {/* ─── UNDER WORK MODAL FOR AI IMPORT BILL ─── */}
+            <Modal visible={underWorkModalVisible} animationType="fade" transparent onRequestClose={() => setUnderWorkModalVisible(false)}>
+                <View style={styles.modalOverlay}>
+                    <View style={[styles.deleteModal, r.isSmall && { width: '90%', maxWidth: 380 }]}>
+                        <View style={[styles.deleteIconBox, { backgroundColor: COLORS.warningLight || 'rgba(184, 134, 11, 0.10)' }]}>
+                            <Ionicons name="construct-outline" size={32} color={COLORS.warning || '#B8860B'} />
+                        </View>
+                        <Text style={styles.deleteTitle}>AI Import Bill</Text>
+                        <Text style={[styles.deleteDesc, { textAlign: 'center', marginTop: 4, color: COLORS.textSecondary }]}>
+                            This feature is under work, please keep patience.
+                        </Text>
+                        <View style={[styles.deleteActions, { marginTop: 8 }]}>
+                            <TouchableOpacity
+                                style={[styles.btnPrimary, { flex: 1, paddingVertical: 10, height: 38, alignItems: 'center', justifyContent: 'center' }]}
+                                onPress={() => setUnderWorkModalVisible(false)}
+                            >
+                                <Text style={styles.btnPrimaryText}>Got it</Text>
+                            </TouchableOpacity>
+                        </View>
+                    </View>
+                </View>
+            </Modal>
+
             {/* ─── AI IMPORT UPLOAD MODAL ─── */}
             <Modal visible={autoImportNoticeVisible} animationType="fade" transparent>
                 <View style={styles.modalOverlay}>
@@ -1086,6 +1248,141 @@ export default function PurchaseScreen({ route, navigation }) {
                 </View>
             </Modal>
 
+            {/* ─── NEW PURCHASE DRAFT MODAL (STEP 1) ─── */}
+            <Modal visible={draftModalVisible} animationType="fade" transparent onRequestClose={() => setDraftModalVisible(false)}>
+                <View style={styles.modalOverlay}>
+                    <View style={[styles.uploadFormModal, { width: 480, maxWidth: '95%' }]}>
+                        {/* Header */}
+                        <View style={styles.uploadFormHeader}>
+                            <View style={styles.uploadFormIconBox}>
+                                <Ionicons name="document-text-outline" size={20} color={COLORS.primary} />
+                            </View>
+                            <View style={{ flex: 1 }}>
+                                <Text style={styles.uploadFormTitle}>Add Purchase (Draft & Info)</Text>
+                                <Text style={styles.uploadFormSubtitle}>Step 1: Upload bill image & basic details</Text>
+                            </View>
+                            <TouchableOpacity onPress={() => setDraftModalVisible(false)} style={styles.uploadFormCloseBtn}>
+                                <Ionicons name="close" size={18} color={COLORS.textMuted} />
+                            </TouchableOpacity>
+                        </View>
+
+                        <ScrollView style={styles.uploadFormBody}>
+                            {/* Bill Image Upload Picker */}
+                            <Text style={styles.formLabel}>Bill Image / Photo (Optional)</Text>
+                            <TouchableOpacity
+                                style={{
+                                    borderWidth: 1.5,
+                                    borderColor: draftSelectedFile ? COLORS.primary : COLORS.border,
+                                    borderStyle: 'dashed',
+                                    borderRadius: 8,
+                                    padding: 16,
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    backgroundColor: draftSelectedFile ? COLORS.primaryGhost : COLORS.bgInput,
+                                    marginBottom: 10
+                                }}
+                                onPress={handlePickDraftFile}
+                            >
+                                {draftSelectedFile ? (
+                                    <View style={{ alignItems: 'center' }}>
+                                        <Ionicons name="checkmark-circle" size={30} color={COLORS.primary} />
+                                        <Text style={{ marginTop: 4, fontWeight: '600', color: COLORS.primary, fontSize: 13 }}>{draftSelectedFile.name}</Text>
+                                        <Text style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 2 }}>Click to change photo</Text>
+                                    </View>
+                                ) : (
+                                    <View style={{ alignItems: 'center' }}>
+                                        <Ionicons name="camera-outline" size={30} color={COLORS.primary} />
+                                        <Text style={{ marginTop: 4, fontWeight: '600', color: COLORS.textPrimary, fontSize: 13 }}>Take Photo or Choose Bill Image</Text>
+                                        <Text style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 2 }}>Supported: JPG, PNG, HEIC (iPhone)</Text>
+                                    </View>
+                                )}
+                            </TouchableOpacity>
+
+                            {/* Supplier Name */}
+                            <View style={styles.formGroup}>
+                                <Text style={styles.formLabel}>Supplier Name</Text>
+                                <View style={styles.formInputRow}>
+                                    <TextInput
+                                        style={styles.formInput}
+                                        placeholder="Enter supplier name"
+                                        placeholderTextColor={COLORS.textMuted}
+                                        value={draftForm.supplier_name}
+                                        onChangeText={(val) => setDraftForm(prev => ({ ...prev, supplier_name: val }))}
+                                    />
+                                </View>
+                            </View>
+
+                            {/* Bill Date */}
+                            <View style={styles.formGroup}>
+                                <Text style={styles.formLabel}>Bill Date</Text>
+                                <View style={styles.formInputRow}>
+                                    <TextInput
+                                        style={styles.formInput}
+                                        placeholder="YYYY-MM-DD"
+                                        placeholderTextColor={COLORS.textMuted}
+                                        value={draftForm.bill_date}
+                                        onChangeText={(val) => setDraftForm(prev => ({ ...prev, bill_date: val }))}
+                                    />
+                                </View>
+                            </View>
+
+                            {/* Bill No / Invoice No */}
+                            <View style={styles.formGroup}>
+                                <Text style={styles.formLabel}>Invoice / Bill No.</Text>
+                                <View style={styles.formInputRow}>
+                                    <TextInput
+                                        style={styles.formInput}
+                                        placeholder="e.g. INV-90812"
+                                        placeholderTextColor={COLORS.textMuted}
+                                        value={draftForm.bill_no}
+                                        onChangeText={(val) => setDraftForm(prev => ({ ...prev, bill_no: val }))}
+                                    />
+                                </View>
+                            </View>
+
+                            {/* Notes */}
+                            <View style={styles.formGroup}>
+                                <Text style={styles.formLabel}>Notes / Remarks</Text>
+                                <View style={styles.formInputRow}>
+                                    <TextInput
+                                        style={styles.formInput}
+                                        placeholder="Additional notes..."
+                                        placeholderTextColor={COLORS.textMuted}
+                                        value={draftForm.notes}
+                                        onChangeText={(val) => setDraftForm(prev => ({ ...prev, notes: val }))}
+                                    />
+                                </View>
+                            </View>
+                        </ScrollView>
+
+                        {/* Footer Actions */}
+                        <View style={{ padding: 14, borderTopWidth: 0.5, borderTopColor: COLORS.border, flexDirection: 'row', gap: 10, justifyContent: 'flex-end', backgroundColor: '#F8FAF9' }}>
+                            <TouchableOpacity
+                                style={[styles.btnSecondary, { height: 36, paddingHorizontal: 12 }]}
+                                onPress={handleDirectFullPurchase}
+                            >
+                                <Text style={[styles.btnSecondaryText, { color: COLORS.textPrimary }]}>Skip to Full Form</Text>
+                            </TouchableOpacity>
+
+                            <TouchableOpacity
+                                style={[styles.btnPrimary, { height: 36, paddingHorizontal: 18 }]}
+                                onPress={handleSaveDraft}
+                                disabled={draftLoading}
+                            >
+                                {draftLoading ? (
+                                    <ActivityIndicator size="small" color={COLORS.white} />
+                                ) : (
+                                    <>
+                                        <Ionicons name="cloud-upload-outline" size={15} color={COLORS.white} style={{ marginRight: 6 }} />
+                                        <Text style={styles.btnPrimaryText}>Save Draft</Text>
+                                    </>
+                                )}
+                            </TouchableOpacity>
+                        </View>
+                    </View>
+                </View>
+            </Modal>
+
             {/* ─── MANUAL PURCHASE MODAL ─── */}
             <Modal visible={manualPurchaseModalVisible} transparent animationType="slide">
                 <View style={formStyles.overlay}>
@@ -1100,6 +1397,23 @@ export default function PurchaseScreen({ route, navigation }) {
                             </TouchableOpacity>
                         </View>
                         <ScrollView style={formStyles.body}>
+                            {manualPurchaseForm.bill_image_url && (
+                                <View style={{ backgroundColor: '#F0F9FF', padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#BAE6FD', marginBottom: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                                        <Ionicons name="image" size={20} color="#0284C7" />
+                                        <View>
+                                            <Text style={{ fontSize: 13, fontWeight: '600', color: '#0369A1' }}>Attached Bill Image Available</Text>
+                                            <Text style={{ fontSize: 11, color: '#0284C7' }}>Click view to open full high-res bill photo</Text>
+                                        </View>
+                                    </View>
+                                    <TouchableOpacity
+                                        style={{ backgroundColor: '#0284C7', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 6 }}
+                                        onPress={() => openPreview(manualPurchaseForm.bill_image_url)}
+                                    >
+                                        <Text style={{ color: '#FFFFFF', fontWeight: '600', fontSize: 12 }}>View Bill Image</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            )}
                             {/* Supplier Section */}
                             <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.textPrimary, marginBottom: 10 }}>1. Supplier Info</Text>
                             <View style={{ flexDirection: r.isSmall ? 'column' : 'row', gap: 15, marginBottom: 20 }}>

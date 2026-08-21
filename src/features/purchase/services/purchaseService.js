@@ -48,6 +48,11 @@ export const finalizePurchase = async (purchaseId, meta) => {
     return response.data;
 };
 
+export const createPurchaseDraft = async (draftData) => {
+    const response = await api.post('/purchase/draft', draftData);
+    return response.data;
+};
+
 export const createManualPurchase = async (purchaseData) => {
     const response = await api.post(`/purchase/manual`, purchaseData);
     return response.data;

@@ -894,7 +894,7 @@ export default function InventoryScreen({ navigation, route }) {
         let count = 0;
         
         bill.imported_items.forEach(item => {
-            const product = products.find(p => p._id === item.inventoryId);
+            const product = products.find(p => String(p._id) === String(item.inventoryId));
             if (product) {
                 newCart[product._id] = item.quantity || 1;
                 count += newCart[product._id];
