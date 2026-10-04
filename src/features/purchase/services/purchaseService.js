@@ -64,14 +64,14 @@ export const savePurchaseJson = async (id, payload) => {
 };
 
 /**
- * Upload a purchase bill for AI auto-import.
- * This runs asynchronously on the backend.
+ * Upload a purchase bill for AI parsing via server-side proxy.
+ * The server forwards the image to bill-to-json.onrender.com — avoids CORS.
  * @param {FormData} formData - must include a field named "bill"
  */
 export const autoImportBill = async (formData) => {
-    const response = await api.post('/product/auto-import', formData, {
+    const response = await api.post('/purchase/ai-import/parse-bill', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 60000,
+        timeout: 100000, // 100 s — external API can be slow on cold start
     });
     return response.data;
 };

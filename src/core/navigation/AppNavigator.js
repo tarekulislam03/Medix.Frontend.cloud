@@ -36,6 +36,7 @@ const linking = {
                     Invoices: 'invoices',
                     Savings: 'savings',
                     Payment: 'payment/store',
+                    Performance: 'performance',
                 },
             },
         },

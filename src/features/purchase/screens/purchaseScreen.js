@@ -18,19 +18,42 @@ import { Ionicons } from '@expo/vector-icons';
 import { COLORS } from '../../../core/constants/theme';
 import { useResponsive } from '../../../core/utils/responsive';
 import { uploadPurchaseBill, getPurchases, deletePurchase, createManualPurchase, autoImportBill, confirmAutoImport, finalizePurchase } from '../services/purchaseService';
+import imageCompression from 'browser-image-compression';
 
 // ─── File picker helper (web only — uses <input type="file"> ────────────────
-const pickFileWeb = () =>
+const pickFileWeb = (acceptStr) =>
     new Promise((resolve) => {
         const input = document.createElement('input');
         input.type = 'file';
-        input.accept = 'image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif,application/pdf,image/*';
+        input.accept = acceptStr || 'image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif,image/*';
         input.onchange = (e) => {
             const file = e.target.files?.[0] ?? null;
             resolve(file);
         };
         input.click();
     });
+
+// ─── Image compressor — target < 500 KB, good quality ───────────────────────
+const compressImageForUpload = async (file) => {
+    // browser-image-compression handles JPEG, PNG, WEBP, HEIC/HEIF natively
+    const options = {
+        maxSizeMB: 0.45,          // target ~450 KB so we stay safely under 500 KB
+        maxWidthOrHeight: 2400,   // keep enough resolution for OCR
+        useWebWorker: true,
+        initialQuality: 0.85,
+        fileType: 'image/jpeg',   // always output JPEG (converts HEIC → JPEG too)
+    };
+    try {
+        const compressed = await imageCompression(file, options);
+        // Give the compressed blob a proper name
+        const ext = 'jpg';
+        const baseName = file.name.replace(/\.[^.]+$/, '');
+        return new File([compressed], `${baseName}.${ext}`, { type: 'image/jpeg' });
+    } catch (e) {
+        console.warn('Image compression failed, using original:', e.message);
+        return file; // fallback — upload original
+    }
+};
 
 // ─── Format date helper ─────────────────────────────────────────────────────
 const formatDate = (iso) => {
@@ -221,10 +244,13 @@ export default function PurchaseScreen({ route, navigation }) {
     // Upload state
     const [uploading, setUploading] = useState(false);
     const [uploadProgress, setUploadProgress] = useState('');
-    const [uploadSuccessModalVisible, setUploadSuccessModalVisible] = useState(false);
-    const [autoImportNoticeVisible, setAutoImportNoticeVisible] = useState(false);
-    const [underWorkModalVisible, setUnderWorkModalVisible] = useState(false);
     const [uploadHints, setUploadHints] = useState({ supplier_name: '', bill_date: '', total_amount: '' });
+
+    // AI Import review panel state
+    const [aiReviewModalVisible, setAiReviewModalVisible] = useState(false);
+    const [aiReviewItems, setAiReviewItems] = useState([]);
+    const [aiReviewMeta, setAiReviewMeta] = useState({ supplier_name: '', bill_date: '', bill_no: '', total_amount: '' });
+    const [aiReviewLoading, setAiReviewLoading] = useState(false);
 
     // Preview modal
     const [previewUrl, setPreviewUrl] = useState(null);
@@ -576,41 +602,99 @@ export default function PurchaseScreen({ route, navigation }) {
         }
     };
 
-    const handleUploadBill = () => {
-        setUnderWorkModalVisible(true);
-    };
-
-    const confirmUploadBill = async () => {
-        setAutoImportNoticeVisible(false);
+    const handleUploadBill = async () => {
         try {
-            let file = null;
+            // Pick image (HEIC, HEIF, JPEG, JPG, PNG all supported)
+            const file = await pickFileWeb('image/jpeg,image/jpg,image/png,image/heic,image/heif,.heic,.heif,image/*');
+            if (!file) return;
 
-            file = await pickFileWeb();
-            
-            if (!file) return; // user cancelled
-
-            // Upload directly instead of opening modal
             setUploading(true);
-            setUploadProgress('Uploading bill to cloud for AI processing...');
+            setUploadProgress('Compressing image…');
 
+            // Compress to under 500 KB
+            const compressed = await compressImageForUpload(file);
+
+            setUploadProgress('Sending bill to AI for processing… (this may take ~30s)');
+
+            // POST to our own server proxy — avoids browser CORS on the external API
             const formData = new FormData();
-            formData.append('bill', file, file.name);
-            if (uploadHints.supplier_name) formData.append('supplier_name', uploadHints.supplier_name);
-            if (uploadHints.bill_date) formData.append('bill_date', uploadHints.bill_date);
-            if (uploadHints.total_amount) formData.append('total_amount', uploadHints.total_amount);
+            formData.append('bill', compressed, compressed.name);
 
-            await autoImportBill(formData);
+            const response = await autoImportBill(formData); // reuses existing service which hits /purchase/ai-import/parse-bill
+            const data = response?.data ?? response ?? {};
 
-            setUploadSuccessModalVisible(true);
-            await fetchPurchases();
+            // Normalise response — the API may wrap in data / bills array etc.
+            const billData = data?.data ?? data?.bills?.[0] ?? data ?? {};
+            const items = billData.items ?? billData.extracted_items ?? [];
+            const meta = {
+                supplier_name: billData.supplier_name ?? billData.vendor_name ?? '',
+                bill_date: billData.bill_date ?? billData.date ?? '',
+                bill_no: billData.bill_no ?? billData.invoice_number ?? billData.invoice_no ?? '',
+                total_amount: String(billData.total_amount ?? billData.total ?? ''),
+            };
+
+            // Show review panel
+            setAiReviewItems(items.map(it => ({
+                medicine_name: it.medicine_name ?? it.product_name ?? it.name ?? '',
+                mrp: String(it.mrp ?? ''),
+                quantity: String(it.quantity ?? ''),
+                batch_number: it.batch_number ?? it.batch ?? '',
+                expiry_date: it.expiry_date ?? it.expiry ?? '',
+                hsn_code: it.hsn_code ?? it.hsn ?? '',
+                gst: String(it.gst ?? it.gst_rate ?? ''),
+                rate: String(it.rate ?? it.cost_price ?? it.price ?? ''),
+                discount: String(it.discount ?? '0'),
+            })));
+            setAiReviewMeta(meta);
+            setAiReviewModalVisible(true);
 
         } catch (err) {
-            console.error('File pick or upload error:', err);
-            Alert.alert('Upload Failed', err?.message || 'Could not start upload processing.');
+            console.error('AI import error:', err);
+            Alert.alert('AI Import Failed', err?.message || 'Could not process bill image. Please try again.');
         } finally {
             setUploading(false);
             setUploadProgress('');
         }
+    };
+
+    // Called when user hits "Confirm Import" on the AI review panel
+    const handleAiReviewConfirm = async () => {
+        if (!aiReviewItems.length) {
+            Alert.alert('No Items', 'No items to import. Please check the bill and try again.');
+            return;
+        }
+        setAiReviewLoading(true);
+        try {
+            const payload = {
+                supplier_name: aiReviewMeta.supplier_name,
+                bill_no: aiReviewMeta.bill_no,
+                bill_date: aiReviewMeta.bill_date,
+                total_amount: Number(aiReviewMeta.total_amount) || 0,
+                items: aiReviewItems,
+                source: 'auto_import',
+            };
+            await createManualPurchase(payload);
+            Alert.alert('Success', 'Bill imported and stock updated successfully!');
+            setAiReviewModalVisible(false);
+            setAiReviewItems([]);
+            setAiReviewMeta({ supplier_name: '', bill_date: '', bill_no: '', total_amount: '' });
+            fetchPurchases();
+        } catch (err) {
+            console.error('AI confirm error:', err);
+            Alert.alert('Import Failed', err?.message || 'Failed to confirm import.');
+        } finally {
+            setAiReviewLoading(false);
+        }
+    };
+
+    const handleAiReviewItemChange = (index, field, value) => {
+        const updated = [...aiReviewItems];
+        updated[index] = { ...updated[index], [field]: value };
+        setAiReviewItems(updated);
+    };
+
+    const handleAiReviewItemDelete = (index) => {
+        setAiReviewItems(aiReviewItems.filter((_, i) => i !== index));
     };
 
     // ─── REVIEW AUTO IMPORT ────────────────────────────────────────────────
@@ -1134,114 +1218,137 @@ export default function PurchaseScreen({ route, navigation }) {
                 </View>
             </Modal>
 
-            {/* ─── UNDER WORK MODAL FOR AI IMPORT BILL ─── */}
-            <Modal visible={underWorkModalVisible} animationType="fade" transparent onRequestClose={() => setUnderWorkModalVisible(false)}>
+            {/* ─── AI IMPORT REVIEW PANEL ─── */}
+            <Modal
+                visible={aiReviewModalVisible}
+                animationType="slide"
+                transparent
+                onRequestClose={() => { if (!aiReviewLoading) setAiReviewModalVisible(false); }}
+            >
                 <View style={styles.modalOverlay}>
-                    <View style={[styles.deleteModal, r.isSmall && { width: '90%', maxWidth: 380 }]}>
-                        <View style={[styles.deleteIconBox, { backgroundColor: COLORS.warningLight || 'rgba(184, 134, 11, 0.10)' }]}>
-                            <Ionicons name="construct-outline" size={32} color={COLORS.warning || '#B8860B'} />
-                        </View>
-                        <Text style={styles.deleteTitle}>AI Import Bill</Text>
-                        <Text style={[styles.deleteDesc, { textAlign: 'center', marginTop: 4, color: COLORS.textSecondary }]}>
-                            This feature is under work, please keep patience.
-                        </Text>
-                        <View style={[styles.deleteActions, { marginTop: 8 }]}>
-                            <TouchableOpacity
-                                style={[styles.btnPrimary, { flex: 1, paddingVertical: 10, height: 38, alignItems: 'center', justifyContent: 'center' }]}
-                                onPress={() => setUnderWorkModalVisible(false)}
-                            >
-                                <Text style={styles.btnPrimaryText}>Got it</Text>
-                            </TouchableOpacity>
-                        </View>
-                    </View>
-                </View>
-            </Modal>
-
-            {/* ─── AI IMPORT UPLOAD MODAL ─── */}
-            <Modal visible={autoImportNoticeVisible} animationType="fade" transparent>
-                <View style={styles.modalOverlay}>
-                    <View style={[styles.uploadFormModal, r.isSmall && { width: '90%' }]}>
-                        <View style={styles.uploadFormHeader}>
-                            <View style={styles.uploadFormIconBox}>
-                                <Ionicons name="sparkles" size={20} color={COLORS.primary} />
-                            </View>
+                    <View style={[formStyles.container, { width: '96%', maxWidth: 900, maxHeight: '92%' }]}>
+                        {/* Header */}
+                        <View style={[formStyles.header, { backgroundColor: '#F0FDF4', borderBottomColor: '#BBF7D0' }]}>
                             <View style={{ flex: 1 }}>
-                                <Text style={styles.uploadFormTitle}>AI Bill Import</Text>
-                                <Text style={styles.uploadFormSubtitle}>Optional hints to improve extraction accuracy.</Text>
+                                <Text style={[formStyles.title, { color: '#065F46' }]}>
+                                    <Ionicons name="sparkles" size={14} color="#065F46" /> AI Bill Review
+                                </Text>
+                                <Text style={formStyles.subtitle}>
+                                    Review extracted data before importing. You can edit or delete any row.
+                                </Text>
                             </View>
-                            <TouchableOpacity style={styles.uploadFormCloseBtn} onPress={() => setAutoImportNoticeVisible(false)}>
-                                <Ionicons name="close" size={18} color={COLORS.textMuted} />
-                            </TouchableOpacity>
-                        </View>
-                        <View style={styles.uploadFormBody}>
-                            <View style={styles.formGroup}>
-                                <Text style={styles.formLabel}>Supplier Name</Text>
-                                <View style={styles.formInputRow}>
-                                    <TextInput
-                                        style={styles.formInput}
-                                        placeholder="e.g. Apollo Pharmacy"
-                                        placeholderTextColor={COLORS.textMuted}
-                                        value={uploadHints.supplier_name}
-                                        onChangeText={t => setUploadHints(h => ({ ...h, supplier_name: t }))}
-                                    />
-                                </View>
-                            </View>
-                            <View style={styles.formGroup}>
-                                <Text style={styles.formLabel}>Bill Date</Text>
-                                <View style={styles.formInputRow}>
-                                    <TextInput
-                                        style={styles.formInput}
-                                        placeholder="YYYY-MM-DD"
-                                        placeholderTextColor={COLORS.textMuted}
-                                        value={uploadHints.bill_date}
-                                        onChangeText={t => setUploadHints(h => ({ ...h, bill_date: t }))}
-                                    />
-                                </View>
-                            </View>
-                            <View style={styles.formGroup}>
-                                <Text style={styles.formLabel}>Total Amount</Text>
-                                <View style={styles.formInputRow}>
-                                    <TextInput
-                                        style={styles.formInput}
-                                        placeholder="0.00"
-                                        keyboardType="numeric"
-                                        placeholderTextColor={COLORS.textMuted}
-                                        value={uploadHints.total_amount}
-                                        onChangeText={t => setUploadHints(h => ({ ...h, total_amount: t }))}
-                                    />
-                                </View>
-                            </View>
-                        </View>
-                        <View style={styles.uploadFormFooter}>
-                            <TouchableOpacity style={[styles.btnSecondary, { flex: 1 }]} onPress={() => setAutoImportNoticeVisible(false)}>
-                                <Text style={styles.btnSecondaryText}>Cancel</Text>
-                            </TouchableOpacity>
-                            <TouchableOpacity style={[styles.btnPrimary, { flex: 1 }]} onPress={confirmUploadBill}>
-                                <Ionicons name="image-outline" size={14} color={COLORS.white} style={{ marginRight: 6 }} />
-                                <Text style={styles.btnPrimaryText}>Select Image</Text>
-                            </TouchableOpacity>
-                        </View>
-                    </View>
-                </View>
-            </Modal>
-
-            {/* ─── UPLOAD SUCCESS MODAL ─── */}
-            <Modal visible={uploadSuccessModalVisible} animationType="fade" transparent>
-                <View style={styles.modalOverlay}>
-                    <View style={[styles.deleteModal, r.isSmall && { width: '90%', maxWidth: 380 }]}>
-                        <View style={[styles.deleteIconBox, { backgroundColor: COLORS.successGhost }]}>
-                            <Ionicons name="checkmark-circle-outline" size={32} color={COLORS.success} />
-                        </View>
-                        <Text style={styles.deleteTitle}>Upload Successful!</Text>
-                        <Text style={[styles.deleteDesc, { textAlign: 'center' }]}>
-                            Bill uploaded successfully. The processing is in progress and it can take up to a few hours. You can close this and continue billing.
-                        </Text>
-                        <View style={styles.deleteActions}>
                             <TouchableOpacity
-                                style={[styles.btnPrimary, { flex: 1, paddingVertical: 12, alignItems: 'center' }]}
-                                onPress={() => setUploadSuccessModalVisible(false)}
+                                onPress={() => { if (!aiReviewLoading) setAiReviewModalVisible(false); }}
+                                disabled={aiReviewLoading}
                             >
-                                <Text style={styles.btnPrimaryText}>Got it</Text>
+                                <Ionicons name="close" size={22} color={COLORS.textMuted} />
+                            </TouchableOpacity>
+                        </View>
+
+                        {/* Meta fields */}
+                        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10, padding: 12, borderBottomWidth: 1, borderBottomColor: '#E2E8F0', backgroundColor: '#FAFFFE' }}>
+                            {[
+                                { label: 'Supplier', key: 'supplier_name', placeholder: 'Supplier name' },
+                                { label: 'Bill No', key: 'bill_no', placeholder: 'Invoice number' },
+                                { label: 'Bill Date', key: 'bill_date', placeholder: 'YYYY-MM-DD' },
+                                { label: 'Total Amount', key: 'total_amount', placeholder: '0.00' },
+                            ].map(f => (
+                                <View key={f.key} style={{ minWidth: 160, flex: 1 }}>
+                                    <Text style={[formStyles.label, { marginBottom: 4 }]}>{f.label}</Text>
+                                    <TextInput
+                                        style={[formStyles.input, { height: 32 }]}
+                                        value={aiReviewMeta[f.key]}
+                                        onChangeText={v => setAiReviewMeta(m => ({ ...m, [f.key]: v }))}
+                                        placeholder={f.placeholder}
+                                        placeholderTextColor={COLORS.textMuted}
+                                    />
+                                </View>
+                            ))}
+                        </View>
+
+                        {/* Items table */}
+                        <ScrollView style={formStyles.body}>
+                            {/* Table header */}
+                            <View style={[formStyles.tableRow, formStyles.tableHeader]}>
+                                {['Medicine / Product', 'Qty', 'Rate', 'MRP', 'GST%', 'Discount%', 'Batch', 'Expiry', ''].map((h, i) => (
+                                    <View key={i} style={[formStyles.tableCell, { flex: i === 0 ? 2.5 : i === 8 ? 0.5 : 1, borderRightColor: '#CBD5E1' }]}>
+                                        <Text style={formStyles.tableHeaderText}>{h}</Text>
+                                    </View>
+                                ))}
+                            </View>
+
+                            {aiReviewItems.length === 0 ? (
+                                <View style={{ padding: 24, alignItems: 'center', opacity: 0.5 }}>
+                                    <Ionicons name="alert-circle-outline" size={32} color={COLORS.textMuted} />
+                                    <Text style={{ marginTop: 8, color: COLORS.textMuted, fontSize: 13 }}>
+                                        No items were extracted. The bill may be unclear.
+                                    </Text>
+                                </View>
+                            ) : aiReviewItems.map((item, idx) => (
+                                <View key={idx} style={[formStyles.tableRow, idx % 2 === 1 && { backgroundColor: '#F8FAFC' }]}>
+                                    {[
+                                        { key: 'medicine_name', flex: 2.5 },
+                                        { key: 'quantity', flex: 1 },
+                                        { key: 'rate', flex: 1 },
+                                        { key: 'mrp', flex: 1 },
+                                        { key: 'gst', flex: 1 },
+                                        { key: 'discount', flex: 1 },
+                                        { key: 'batch_number', flex: 1 },
+                                        { key: 'expiry_date', flex: 1 },
+                                    ].map(col => (
+                                        <View key={col.key} style={[formStyles.tableCell, { flex: col.flex }]}>
+                                            <TextInput
+                                                style={[formStyles.input, { fontSize: 12 }]}
+                                                value={String(item[col.key] ?? '')}
+                                                onChangeText={v => handleAiReviewItemChange(idx, col.key, v)}
+                                                placeholder="—"
+                                                placeholderTextColor="#CBD5E1"
+                                            />
+                                        </View>
+                                    ))}
+                                    {/* Delete row */}
+                                    <View style={[formStyles.tableCell, { flex: 0.5, alignItems: 'center', justifyContent: 'center' }]}>
+                                        <TouchableOpacity onPress={() => handleAiReviewItemDelete(idx)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                                            <Ionicons name="trash-outline" size={15} color={COLORS.error} />
+                                        </TouchableOpacity>
+                                    </View>
+                                </View>
+                            ))}
+
+                            {/* Add row */}
+                            <TouchableOpacity
+                                style={{ flexDirection: 'row', alignItems: 'center', padding: 10, gap: 6 }}
+                                onPress={() => setAiReviewItems(prev => [...prev, {
+                                    medicine_name: '', mrp: '', quantity: '', batch_number: '',
+                                    expiry_date: '', hsn_code: '', gst: '', rate: '', discount: '0',
+                                }])}
+                            >
+                                <Ionicons name="add-circle-outline" size={16} color={COLORS.primary} />
+                                <Text style={{ fontSize: 12, color: COLORS.primary, fontWeight: '600' }}>Add Row</Text>
+                            </TouchableOpacity>
+                        </ScrollView>
+
+                        {/* Footer */}
+                        <View style={[formStyles.footer, { padding: 12 }]}>
+                            <Text style={{ flex: 1, fontSize: 11, color: COLORS.textMuted }}>
+                                {aiReviewItems.length} item{aiReviewItems.length !== 1 ? 's' : ''} to import
+                            </Text>
+                            <TouchableOpacity
+                                style={formStyles.cancelBtn}
+                                onPress={() => setAiReviewModalVisible(false)}
+                                disabled={aiReviewLoading}
+                            >
+                                <Text style={formStyles.cancelBtnText}>Cancel</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                                style={[formStyles.saveBtn, { minWidth: 140 }]}
+                                onPress={handleAiReviewConfirm}
+                                disabled={aiReviewLoading}
+                            >
+                                {aiReviewLoading
+                                    ? <ActivityIndicator size="small" color="#fff" />
+                                    : <Text style={formStyles.saveBtnText}>✓ Confirm Import</Text>
+                                }
                             </TouchableOpacity>
                         </View>
                     </View>
