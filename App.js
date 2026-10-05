@@ -36,6 +36,7 @@ export default function App() {
         console.warn('Failed to load stored token:', e);
       } finally {
         setIsLoading(false);
+        //this is the test page
       }
     })();
   }, []);

@@ -17,18 +17,26 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS } from '../../../core/constants/theme';
 import { useResponsive } from '../../../core/utils/responsive';
-import { uploadPurchaseBill, getPurchases, deletePurchase, createManualPurchase, autoImportBill, confirmAutoImport, finalizePurchase } from '../services/purchaseService';
+import { uploadPurchaseBill, getPurchases, deletePurchase, createManualPurchase, finalizePurchase, startAiImportJob, getAiImportJobs, confirmAiImportJob, rejectAiImportJob, createPurchaseDraft } from '../services/purchaseService';
 import imageCompression from 'browser-image-compression';
 
 // ─── File picker helper (web only — uses <input type="file"> ────────────────
-const pickFileWeb = (acceptStr) =>
+const pickFileWeb = (acceptStr, multiple = false) =>
     new Promise((resolve) => {
         const input = document.createElement('input');
         input.type = 'file';
+        if (multiple) {
+            input.multiple = true;
+        }
         input.accept = acceptStr || 'image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif,image/*';
         input.onchange = (e) => {
-            const file = e.target.files?.[0] ?? null;
-            resolve(file);
+            if (multiple) {
+                const files = e.target.files ? Array.from(e.target.files) : [];
+                resolve(files);
+            } else {
+                const file = e.target.files?.[0] ?? null;
+                resolve(file);
+            }
         };
         input.click();
     });
@@ -246,11 +254,25 @@ export default function PurchaseScreen({ route, navigation }) {
     const [uploadProgress, setUploadProgress] = useState('');
     const [uploadHints, setUploadHints] = useState({ supplier_name: '', bill_date: '', total_amount: '' });
 
-    // AI Import review panel state
+    // ─── Background AI Import Jobs ───────────────────────────────────────────
+    // Immediately-shown local image preview after user picks file (before job starts)
+    const [localPreviewUri, setLocalPreviewUri] = useState(null);
+    const [localPreviewName, setLocalPreviewName] = useState('');
+    // All AI import jobs polled from the server
+    const [aiJobs, setAiJobs] = useState([]);
+    // Job review modal — open when user wants to review a ready/low_confidence job
+    const [aiJobReviewVisible, setAiJobReviewVisible] = useState(false);
+    const [aiJobReviewData, setAiJobReviewData] = useState(null); // the selected job
+    const [aiJobReviewItems, setAiJobReviewItems] = useState([]);
+    const [aiJobReviewMeta, setAiJobReviewMeta] = useState({ supplier_name: '', bill_date: '', bill_no: '', total_amount: '' });
+    const [aiJobReviewLoading, setAiJobReviewLoading] = useState(false);
+
+    // ─── Legacy AI review panel state (kept for backward compat) ───────────
     const [aiReviewModalVisible, setAiReviewModalVisible] = useState(false);
     const [aiReviewItems, setAiReviewItems] = useState([]);
     const [aiReviewMeta, setAiReviewMeta] = useState({ supplier_name: '', bill_date: '', bill_no: '', total_amount: '' });
     const [aiReviewLoading, setAiReviewLoading] = useState(false);
+
 
     // Preview modal
     const [previewUrl, setPreviewUrl] = useState(null);
@@ -325,14 +347,27 @@ export default function PurchaseScreen({ route, navigation }) {
 
     useEffect(() => {
         fetchPurchases();
+        fetchAiJobs();
         
-        // Poll every 10 seconds
+        // Poll every 10 seconds — also refreshes AI job statuses in background
         const intervalId = setInterval(() => {
             fetchPurchases(true);
+            fetchAiJobs(true);
         }, 10000);
 
         return () => clearInterval(intervalId);
     }, [fetchPurchases]);
+
+    // ─── FETCH AI IMPORT JOBS ──────────────────────────────────────────────
+    const fetchAiJobs = useCallback(async (silent = false) => {
+        try {
+            const res = await getAiImportJobs();
+            const jobs = res?.data ?? [];
+            setAiJobs(jobs);
+        } catch (err) {
+            if (!silent) console.warn('Fetch AI jobs failed:', err.message);
+        }
+    }, []);
 
     useEffect(() => {
         if (route?.params?.openAddModal) {
@@ -604,60 +639,134 @@ export default function PurchaseScreen({ route, navigation }) {
 
     const handleUploadBill = async () => {
         try {
-            // Pick image (HEIC, HEIF, JPEG, JPG, PNG all supported)
-            const file = await pickFileWeb('image/jpeg,image/jpg,image/png,image/heic,image/heif,.heic,.heif,image/*');
-            if (!file) return;
+            // Pick image(s) (HEIC, HEIF, JPEG, JPG, PNG all supported)
+            const picked = await pickFileWeb('image/jpeg,image/jpg,image/png,image/heic,image/heif,.heic,.heif,image/*', true);
+            if (!picked) return;
+            const files = Array.isArray(picked) ? picked : [picked];
+            if (files.length === 0) return;
+
+            // ── Show local preview immediately so user sees what they uploaded ──
+            const firstFile = files[0];
+            const localUri = URL.createObjectURL(firstFile);
+            setLocalPreviewUri(localUri);
+            setLocalPreviewName(files.length > 1 ? `${files.length} images selected` : firstFile.name);
 
             setUploading(true);
-            setUploadProgress('Compressing image…');
+            setUploadProgress(files.length > 1 ? `Compressing ${files.length} images…` : 'Compressing image…');
 
-            // Compress to under 500 KB
-            const compressed = await compressImageForUpload(file);
+            // Compress all files to under 500 KB each
+            const compressedFiles = await Promise.all(
+                files.map(file => compressImageForUpload(file))
+            );
 
-            setUploadProgress('Sending bill to AI for processing… (this may take ~30s)');
+            setUploadProgress(files.length > 1 ? `Uploading ${compressedFiles.length} images… AI will process in background` : 'Uploading… AI will process in background');
 
-            // POST to our own server proxy — avoids browser CORS on the external API
+            // Send to /purchase/ai-import — server responds with job_id immediately,
+            // AI extraction runs in the background
             const formData = new FormData();
-            formData.append('bill', compressed, compressed.name);
+            compressedFiles.forEach(file => {
+                formData.append('images', file, file.name);
+            });
 
-            const response = await autoImportBill(formData); // reuses existing service which hits /purchase/ai-import/parse-bill
-            const data = response?.data ?? response ?? {};
+            await startAiImportJob(formData);
 
-            // Normalise response — the API may wrap in data / bills array etc.
-            const billData = data?.data ?? data?.bills?.[0] ?? data ?? {};
-            const items = billData.items ?? billData.extracted_items ?? [];
-            const meta = {
-                supplier_name: billData.supplier_name ?? billData.vendor_name ?? '',
-                bill_date: billData.bill_date ?? billData.date ?? '',
-                bill_no: billData.bill_no ?? billData.invoice_number ?? billData.invoice_no ?? '',
-                total_amount: String(billData.total_amount ?? billData.total ?? ''),
-            };
+            // Refresh jobs list so user sees the new processing job
+            await fetchAiJobs();
 
-            // Show review panel
-            setAiReviewItems(items.map(it => ({
-                medicine_name: it.medicine_name ?? it.product_name ?? it.name ?? '',
-                mrp: String(it.mrp ?? ''),
-                quantity: String(it.quantity ?? ''),
-                batch_number: it.batch_number ?? it.batch ?? '',
-                expiry_date: it.expiry_date ?? it.expiry ?? '',
-                hsn_code: it.hsn_code ?? it.hsn ?? '',
-                gst: String(it.gst ?? it.gst_rate ?? ''),
-                rate: String(it.rate ?? it.cost_price ?? it.price ?? ''),
-                discount: String(it.discount ?? '0'),
-            })));
-            setAiReviewMeta(meta);
-            setAiReviewModalVisible(true);
+            Alert.alert(
+                '✅ Uploaded!',
+                files.length > 1
+                    ? `${files.length} bill images uploaded. AI is processing them in the background — you can continue working. Check the "AI Import Jobs" section below for results.`
+                    : 'Your bill image was uploaded. AI is processing it in the background — you can continue working. Check the "AI Import Jobs" section below for results.',
+                [{ text: 'OK' }]
+            );
 
         } catch (err) {
-            console.error('AI import error:', err);
-            Alert.alert('AI Import Failed', err?.message || 'Could not process bill image. Please try again.');
+            console.error('AI import upload error:', err);
+            // Clear local preview on failure
+            setLocalPreviewUri(null);
+            setLocalPreviewName('');
+            Alert.alert('Upload Failed', err?.message || 'Could not upload bill image(s). Please try again.');
         } finally {
             setUploading(false);
             setUploadProgress('');
         }
     };
 
-    // Called when user hits "Confirm Import" on the AI review panel
+    // ─── AI JOB REVIEW ────────────────────────────────────────────────────────
+    const handleOpenAiJobReview = (job) => {
+        setAiJobReviewData(job);
+        const items = (job.extracted_items || []).map(it => ({
+            medicine_name: it.medicine_name ?? '',
+            mrp: String(it.mrp ?? ''),
+            quantity: String(it.quantity ?? ''),
+            batch_number: it.batch_number ?? '',
+            expiry_date: it.expiry_date ?? '',
+            hsn_code: it.hsn_code ?? '',
+            gst: String(it.gst_percentage ?? it.gst ?? ''),
+            rate: String(it.purchase_price ?? it.rate ?? ''),
+            discount: String(it.discount_percentage ?? it.discount ?? '0'),
+        }));
+        setAiJobReviewItems(items);
+        setAiJobReviewMeta({
+            supplier_name: job.supplier_name ?? '',
+            bill_date: job.bill_date ?? '',
+            bill_no: job.bill_no ?? '',
+            total_amount: String(job.total_amount ?? ''),
+        });
+        setAiJobReviewVisible(true);
+    };
+
+    const handleAiJobReviewItemChange = (index, field, value) => {
+        const updated = [...aiJobReviewItems];
+        updated[index] = { ...updated[index], [field]: value };
+        setAiJobReviewItems(updated);
+    };
+
+    const handleAiJobReviewItemDelete = (index) => {
+        setAiJobReviewItems(aiJobReviewItems.filter((_, i) => i !== index));
+    };
+
+    const handleAiJobReviewConfirm = async () => {
+        if (!aiJobReviewItems.length) {
+            Alert.alert('No Items', 'No items to import. Please add items or cancel.');
+            return;
+        }
+        if (!aiJobReviewData?._id) return;
+        setAiJobReviewLoading(true);
+        try {
+            await confirmAiImportJob({
+                job_id: aiJobReviewData._id,
+                items: aiJobReviewItems,
+                supplier_name: aiJobReviewMeta.supplier_name,
+                bill_no: aiJobReviewMeta.bill_no,
+                total_amount: Number(aiJobReviewMeta.total_amount) || 0,
+            });
+            Alert.alert('✅ Import Confirmed', 'Bill imported and inventory updated successfully!');
+            setAiJobReviewVisible(false);
+            setAiJobReviewData(null);
+            setAiJobReviewItems([]);
+            // Refresh both lists
+            fetchAiJobs();
+            fetchPurchases();
+        } catch (err) {
+            console.error('AI job confirm error:', err);
+            Alert.alert('Confirm Failed', err?.message || 'Failed to confirm import.');
+        } finally {
+            setAiJobReviewLoading(false);
+        }
+    };
+
+    const handleAiJobReject = async (jobId) => {
+        try {
+            await rejectAiImportJob(jobId);
+            fetchAiJobs();
+        } catch (err) {
+            Alert.alert('Error', err?.message || 'Failed to reject job.');
+        }
+    };
+
+    // Legacy handlers kept for backward compat with existing Purchase records that have needs_manual_review
     const handleAiReviewConfirm = async () => {
         if (!aiReviewItems.length) {
             Alert.alert('No Items', 'No items to import. Please check the bill and try again.');
@@ -696,6 +805,7 @@ export default function PurchaseScreen({ route, navigation }) {
     const handleAiReviewItemDelete = (index) => {
         setAiReviewItems(aiReviewItems.filter((_, i) => i !== index));
     };
+
 
     // ─── REVIEW AUTO IMPORT ────────────────────────────────────────────────
     const handleOpenReview = (item) => {
@@ -1092,6 +1202,109 @@ export default function PurchaseScreen({ route, navigation }) {
                 </View>
             )}
 
+            {/* ─── AI IMPORT JOBS BANNER ─── */}
+            {(aiJobs.filter(j => ['uploading', 'processing', 'review_ready', 'low_confidence', 'failed'].includes(j.status)).length > 0 || localPreviewUri) && (
+                <View style={styles.aiJobsBanner}>
+                    <View style={styles.aiJobsBannerHeader}>
+                        <Ionicons name="sparkles" size={14} color={COLORS.primary} />
+                        <Text style={styles.aiJobsBannerTitle}>AI Import Jobs</Text>
+                        <TouchableOpacity onPress={() => fetchAiJobs()} style={{ marginLeft: 'auto' }}>
+                            <Ionicons name="refresh" size={14} color={COLORS.textMuted} />
+                        </TouchableOpacity>
+                    </View>
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ padding: 10, gap: 10, flexDirection: 'row' }}>
+                        {/* Local preview card — shown immediately after user picks a file, before job appears */}
+                        {localPreviewUri && uploading && (
+                            <View style={styles.aiJobCard}>
+                                <Image source={{ uri: localPreviewUri }} style={styles.aiJobCardImage} resizeMode="cover" />
+                                <View style={styles.aiJobCardBody}>
+                                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                                        <ActivityIndicator size="small" color={COLORS.primary} />
+                                        <Text style={styles.aiJobCardStatus}>Uploading…</Text>
+                                    </View>
+                                    <Text style={styles.aiJobCardName} numberOfLines={1}>{localPreviewName || 'bill.jpg'}</Text>
+                                </View>
+                            </View>
+                        )}
+                        {aiJobs.filter(j => ['uploading', 'processing', 'review_ready', 'low_confidence', 'failed'].includes(j.status)).map(job => {
+                            const imgUrl = job.images?.[0]?.cloudinary_url;
+                            const isReady = job.status === 'review_ready' || job.status === 'low_confidence';
+                            const isProcessing = job.status === 'uploading' || job.status === 'processing';
+                            const isFailed = job.status === 'failed';
+                            const statusColors = {
+                                uploading: COLORS.textMuted,
+                                processing: '#0284C7',
+                                review_ready: COLORS.primary,
+                                low_confidence: '#D97706',
+                                failed: COLORS.error,
+                            };
+                            const statusLabels = {
+                                uploading: 'Uploading…',
+                                processing: 'AI Processing…',
+                                review_ready: '✓ Ready for Review',
+                                low_confidence: '⚠ Review Needed',
+                                failed: '✗ Failed',
+                            };
+                            return (
+                                <View key={job._id} style={[styles.aiJobCard, isReady && { borderColor: COLORS.primary, borderWidth: 1 }]}>
+                                    {imgUrl ? (
+                                        <Image source={{ uri: imgUrl }} style={styles.aiJobCardImage} resizeMode="cover" />
+                                    ) : (
+                                        <View style={[styles.aiJobCardImage, { backgroundColor: '#F0F4F2', alignItems: 'center', justifyContent: 'center' }]}>
+                                            <Ionicons name="image-outline" size={28} color={COLORS.border} />
+                                        </View>
+                                    )}
+                                    <View style={styles.aiJobCardBody}>
+                                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                                            {isProcessing && <ActivityIndicator size="small" color={statusColors[job.status]} />}
+                                            <Text style={[styles.aiJobCardStatus, { color: statusColors[job.status] }]}>
+                                                {statusLabels[job.status] || job.status}
+                                            </Text>
+                                        </View>
+                                        {job.supplier_name ? (
+                                            <Text style={styles.aiJobCardName} numberOfLines={1}>{job.supplier_name}</Text>
+                                        ) : (
+                                            <Text style={[styles.aiJobCardName, { color: COLORS.textMuted, fontStyle: 'italic' }]}>No supplier yet</Text>
+                                        )}
+                                        {job.overall_confidence > 0 && (
+                                            <Text style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 2 }}>
+                                                Confidence: {Math.round(job.overall_confidence)}%
+                                            </Text>
+                                        )}
+                                        <Text style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 2 }}>
+                                            {job.extracted_items?.length ?? 0} items extracted
+                                        </Text>
+                                        <View style={{ flexDirection: 'row', gap: 6, marginTop: 8 }}>
+                                            {isReady && (
+                                                <TouchableOpacity
+                                                    style={[styles.aiJobActionBtn, { backgroundColor: COLORS.primary }]}
+                                                    onPress={() => handleOpenAiJobReview(job)}
+                                                >
+                                                    <Text style={{ fontSize: 11, fontWeight: '600', color: COLORS.white }}>Review & Import</Text>
+                                                </TouchableOpacity>
+                                            )}
+                                            {(isReady || isFailed) && (
+                                                <TouchableOpacity
+                                                    style={[styles.aiJobActionBtn, { backgroundColor: COLORS.bgDark, borderWidth: 0.5, borderColor: COLORS.border }]}
+                                                    onPress={() => handleAiJobReject(job._id)}
+                                                >
+                                                    <Text style={{ fontSize: 11, fontWeight: '600', color: COLORS.textMuted }}>Discard</Text>
+                                                </TouchableOpacity>
+                                            )}
+                                            {isFailed && (
+                                                <Text style={{ fontSize: 10, color: COLORS.error, marginTop: 4 }} numberOfLines={2}>
+                                                    {job.error_message || 'Processing failed'}
+                                                </Text>
+                                            )}
+                                        </View>
+                                    </View>
+                                </View>
+                            );
+                        })}
+                    </ScrollView>
+                </View>
+            )}
+
             {/* ─── CONTENT: Cards on mobile, Table on desktop ─── */}
             {r.isSmall ? (
                 /* ─── MOBILE: Card List ─── */
@@ -1348,6 +1561,186 @@ export default function PurchaseScreen({ route, navigation }) {
                                 {aiReviewLoading
                                     ? <ActivityIndicator size="small" color="#fff" />
                                     : <Text style={formStyles.saveBtnText}>✓ Confirm Import</Text>
+                                }
+                            </TouchableOpacity>
+                        </View>
+                    </View>
+                </View>
+            </Modal>
+
+            {/* ─── AI JOB REVIEW MODAL ─── */}
+            <Modal
+                visible={aiJobReviewVisible}
+                animationType="slide"
+                transparent
+                onRequestClose={() => { if (!aiJobReviewLoading) setAiJobReviewVisible(false); }}
+            >
+                <View style={styles.modalOverlay}>
+                    <View style={[formStyles.container, { width: '96%', maxWidth: 980, maxHeight: '94%' }]}>
+                        {/* Header */}
+                        <View style={[formStyles.header, { backgroundColor: '#EFF6FF', borderBottomColor: '#BFDBFE' }]}>
+                            <View style={{ flex: 1 }}>
+                                <Text style={[formStyles.title, { color: '#1D4ED8' }]}>
+                                    🤖 AI Import Review
+                                </Text>
+                                <Text style={formStyles.subtitle}>
+                                    Review the AI-extracted data before importing into inventory. You can edit or delete any row.
+                                </Text>
+                                {aiJobReviewData?.overall_confidence > 0 && (
+                                    <Text style={{ fontSize: 11, color: '#6B7280', marginTop: 2 }}>
+                                        AI Confidence: {Math.round(aiJobReviewData.overall_confidence)}% · Model: {aiJobReviewData.llm_used || 'N/A'}
+                                        {aiJobReviewData.status === 'low_confidence' && ' ⚠ Low confidence — please review carefully'}
+                                    </Text>
+                                )}
+                            </View>
+                            {/* Bill image thumbnail */}
+                            {aiJobReviewData?.images?.[0]?.cloudinary_url && (
+                                <TouchableOpacity
+                                    onPress={() => { setPreviewUrl(aiJobReviewData.images[0].cloudinary_url); setPreviewVisible(true); }}
+                                    style={{ marginRight: 12, borderRadius: 4, overflow: 'hidden', borderWidth: 1, borderColor: COLORS.border }}
+                                >
+                                    <Image
+                                        source={{ uri: aiJobReviewData.images[0].cloudinary_url }}
+                                        style={{ width: 60, height: 60 }}
+                                        resizeMode="cover"
+                                    />
+                                    <View style={{ position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: 'rgba(0,0,0,0.5)', paddingVertical: 2, alignItems: 'center' }}>
+                                        <Text style={{ fontSize: 9, color: '#fff', fontWeight: '600' }}>View Bill</Text>
+                                    </View>
+                                </TouchableOpacity>
+                            )}
+                            <TouchableOpacity
+                                onPress={() => { if (!aiJobReviewLoading) setAiJobReviewVisible(false); }}
+                                disabled={aiJobReviewLoading}
+                            >
+                                <Ionicons name="close" size={22} color={COLORS.textMuted} />
+                            </TouchableOpacity>
+                        </View>
+
+                        {/* Meta fields */}
+                        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10, padding: 12, borderBottomWidth: 1, borderBottomColor: '#E2E8F0', backgroundColor: '#F8FAFF' }}>
+                            {[
+                                { label: 'Supplier', key: 'supplier_name', placeholder: 'Supplier name' },
+                                { label: 'Bill No', key: 'bill_no', placeholder: 'Invoice number' },
+                                { label: 'Bill Date', key: 'bill_date', placeholder: 'YYYY-MM-DD' },
+                                { label: 'Total Amount', key: 'total_amount', placeholder: '0.00' },
+                            ].map(f => (
+                                <View key={f.key} style={{ minWidth: 160, flex: 1 }}>
+                                    <Text style={[formStyles.label, { marginBottom: 4 }]}>{f.label}</Text>
+                                    <TextInput
+                                        style={[formStyles.input, { height: 32 }]}
+                                        value={aiJobReviewMeta[f.key]}
+                                        onChangeText={v => setAiJobReviewMeta(m => ({ ...m, [f.key]: v }))}
+                                        placeholder={f.placeholder}
+                                        placeholderTextColor={COLORS.textMuted}
+                                    />
+                                </View>
+                            ))}
+                        </View>
+
+                        {/* Items table */}
+                        <ScrollView style={formStyles.body}>
+                            {/* Table header */}
+                            <View style={[formStyles.tableRow, formStyles.tableHeader]}>
+                                {['Medicine / Product', 'Qty', 'Rate', 'MRP', 'GST%', 'Disc%', 'Batch', 'Expiry', ''].map((h, i) => (
+                                    <View key={i} style={[formStyles.tableCell, { flex: i === 0 ? 2.5 : i === 8 ? 0.5 : 1, borderRightColor: '#CBD5E1' }]}>
+                                        <Text style={formStyles.tableHeaderText}>{h}</Text>
+                                    </View>
+                                ))}
+                            </View>
+
+                            {aiJobReviewItems.length === 0 ? (
+                                <View style={{ padding: 24, alignItems: 'center', opacity: 0.5 }}>
+                                    <Ionicons name="alert-circle-outline" size={32} color={COLORS.textMuted} />
+                                    <Text style={{ marginTop: 8, color: COLORS.textMuted, fontSize: 13 }}>
+                                        No items were extracted. The bill may be unclear or AI could not read it.
+                                    </Text>
+                                    <TouchableOpacity
+                                        style={{ marginTop: 12, flexDirection: 'row', alignItems: 'center', gap: 6 }}
+                                        onPress={() => setAiJobReviewItems([{ medicine_name: '', mrp: '', quantity: '', batch_number: '', expiry_date: '', hsn_code: '', gst: '', rate: '', discount: '0' }])}
+                                    >
+                                        <Ionicons name="add-circle-outline" size={16} color={COLORS.primary} />
+                                        <Text style={{ fontSize: 12, color: COLORS.primary, fontWeight: '600' }}>Add Item Manually</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            ) : aiJobReviewItems.map((item, idx) => (
+                                <View key={idx} style={[formStyles.tableRow, idx % 2 === 1 && { backgroundColor: '#F8FAFC' }]}>
+                                    {[
+                                        { key: 'medicine_name', flex: 2.5 },
+                                        { key: 'quantity', flex: 1 },
+                                        { key: 'rate', flex: 1 },
+                                        { key: 'mrp', flex: 1 },
+                                        { key: 'gst', flex: 1 },
+                                        { key: 'discount', flex: 1 },
+                                        { key: 'batch_number', flex: 1 },
+                                        { key: 'expiry_date', flex: 1 },
+                                    ].map(col => (
+                                        <View key={col.key} style={[formStyles.tableCell, { flex: col.flex }]}>
+                                            <TextInput
+                                                style={[formStyles.input, { fontSize: 12 }]}
+                                                value={String(item[col.key] ?? '')}
+                                                onChangeText={v => handleAiJobReviewItemChange(idx, col.key, v)}
+                                                placeholder="—"
+                                                placeholderTextColor="#CBD5E1"
+                                            />
+                                        </View>
+                                    ))}
+                                    {/* Delete row */}
+                                    <View style={[formStyles.tableCell, { flex: 0.5, alignItems: 'center', justifyContent: 'center' }]}>
+                                        <TouchableOpacity onPress={() => handleAiJobReviewItemDelete(idx)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                                            <Ionicons name="trash-outline" size={15} color={COLORS.error} />
+                                        </TouchableOpacity>
+                                    </View>
+                                </View>
+                            ))}
+
+                            {/* Add row */}
+                            <TouchableOpacity
+                                style={{ flexDirection: 'row', alignItems: 'center', padding: 10, gap: 6 }}
+                                onPress={() => setAiJobReviewItems(prev => [...prev, {
+                                    medicine_name: '', mrp: '', quantity: '', batch_number: '',
+                                    expiry_date: '', hsn_code: '', gst: '', rate: '', discount: '0',
+                                }])}
+                            >
+                                <Ionicons name="add-circle-outline" size={16} color={COLORS.primary} />
+                                <Text style={{ fontSize: 12, color: COLORS.primary, fontWeight: '600' }}>Add Row</Text>
+                            </TouchableOpacity>
+                        </ScrollView>
+
+                        {/* Footer */}
+                        <View style={[formStyles.footer, { padding: 12 }]}>
+                            <Text style={{ flex: 1, fontSize: 11, color: COLORS.textMuted }}>
+                                {aiJobReviewItems.length} item{aiJobReviewItems.length !== 1 ? 's' : ''} to import
+                            </Text>
+                            <TouchableOpacity
+                                style={[formStyles.cancelBtn, { marginRight: 8, borderColor: COLORS.error, borderWidth: 0.5 }]}
+                                onPress={() => {
+                                    if (!aiJobReviewLoading) {
+                                        Alert.alert('Discard Import?', 'This will reject the AI import job. The image will not be imported.', [
+                                            { text: 'Cancel', style: 'cancel' },
+                                            { text: 'Discard', style: 'destructive', onPress: () => { handleAiJobReject(aiJobReviewData._id); setAiJobReviewVisible(false); } },
+                                        ]);
+                                    }
+                                }}
+                                disabled={aiJobReviewLoading}
+                            >
+                                <Text style={[formStyles.cancelBtnText, { color: COLORS.error }]}>Discard</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                                style={formStyles.cancelBtn}
+                                onPress={() => setAiJobReviewVisible(false)}
+                                disabled={aiJobReviewLoading}
+                            >
+                                <Text style={formStyles.cancelBtnText}>Close</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                                style={[formStyles.saveBtn, { minWidth: 160, marginLeft: 8 }]}
+                                onPress={handleAiJobReviewConfirm}
+                                disabled={aiJobReviewLoading}
+                            >
+                                {aiJobReviewLoading
+                                    ? <ActivityIndicator size="small" color="#fff" />
+                                    : <Text style={formStyles.saveBtnText}>✓ Confirm & Import</Text>
                                 }
                             </TouchableOpacity>
                         </View>
@@ -2195,5 +2588,54 @@ const styles = StyleSheet.create({
         borderTopWidth: 0.5,
         borderTopColor: COLORS.border,
         backgroundColor: '#F8FAF9',
+    },
+});
+
+// ─── AI Jobs Banner styles (appended) ─────────────────────────────────────
+// These are used by the AI Jobs horizontal banner
+const aiJobStyles = StyleSheet.create({
+    banner: {
+        borderBottomWidth: 0.5,
+        borderBottomColor: '#C7D7FD',
+        backgroundColor: '#F0F5FF',
+    },
+    bannerHeader: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingHorizontal: 14,
+        paddingVertical: 8,
+        gap: 6,
+        borderBottomWidth: 0.5,
+        borderBottomColor: '#DBEAFE',
+    },
+    bannerTitle: {
+        fontSize: 12,
+        fontWeight: '600',
+        color: '#1D4ED8',
+        letterSpacing: 0.3,
+    },
+    card: {
+        width: 184,
+        borderRadius: 6,
+        borderWidth: 0.5,
+        borderColor: '#C7D7FD',
+        backgroundColor: '#FFFFFF',
+        overflow: 'hidden',
+        flexShrink: 0,
+    },
+    cardImage: {
+        width: '100%',
+        height: 92,
+        backgroundColor: '#EFF6FF',
+    },
+    cardBody: { padding: 8 },
+    cardStatus: { fontSize: 11, fontWeight: '700', color: '#1D4ED8' },
+    cardName: { fontSize: 12, fontWeight: '500', color: '#1A1A1A', marginTop: 2 },
+    actionBtn: {
+        paddingHorizontal: 10,
+        paddingVertical: 5,
+        borderRadius: 4,
+        alignItems: 'center',
+        justifyContent: 'center',
     },
 });

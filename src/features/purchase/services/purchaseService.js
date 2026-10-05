@@ -85,3 +85,46 @@ export const confirmAutoImport = async (data) => {
     const response = await api.post('/product/auto-import/confirm', data);
     return response.data;
 };
+
+// ─── Background AI Import Job API ─────────────────────────────────────────
+
+/**
+ * Start a new background AI import job.
+ * Returns immediately with job_id — processing happens server-side.
+ * @param {FormData} formData - images field (up to 10 images)
+ */
+export const startAiImportJob = async (formData) => {
+    const response = await api.post('/purchase/ai-import', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 30000, // Just upload, no waiting for AI
+    });
+    return response.data;
+};
+
+/**
+ * Get all AI import jobs for the current store.
+ * @param {string} [status] - optional filter: 'processing'|'review_ready'|'low_confidence'|'confirmed'|'rejected'|'failed'
+ */
+export const getAiImportJobs = async (status) => {
+    const url = status ? `/purchase/ai-import/jobs?status=${status}` : `/purchase/ai-import/jobs?_t=${Date.now()}`;
+    const response = await api.get(url);
+    return response.data;
+};
+
+/**
+ * Confirm an AI import job — creates Purchase record + updates inventory.
+ * @param {Object} data - { job_id, items, supplier_name, bill_no, total_amount }
+ */
+export const confirmAiImportJob = async (data) => {
+    const response = await api.post('/purchase/ai-import/confirm', data);
+    return response.data;
+};
+
+/**
+ * Reject/discard an AI import job.
+ * @param {string} jobId
+ */
+export const rejectAiImportJob = async (jobId) => {
+    const response = await api.patch(`/purchase/ai-import/${jobId}/reject`);
+    return response.data;
+};
