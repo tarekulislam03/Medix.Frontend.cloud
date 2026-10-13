@@ -1922,10 +1922,10 @@ export default function BillingScreen({ navigation, route }) {
                     </View>
 
                     {/* Product Search Field */}
-                    <View style={[styles.inputBarCell, { flex: r.isSmall ? undefined : 1.6 }, r.isSmall && { height: 64, width: '100%', borderBottomWidth: 1, borderBottomColor: COLORS.border, backgroundColor: '#F8FAFC' }]}>
+                    <View style={[styles.inputBarCell, { flex: r.isSmall ? undefined : 1.6 }, r.isSmall && { height: 76, width: '100%', borderBottomWidth: 1, borderBottomColor: COLORS.border, backgroundColor: '#F8FAFC' }]}>
                         <View style={styles.searchRelativeWrap}>
                             <View style={[styles.inlineInputBar, r.isSmall && { paddingHorizontal: 12 }]}>
-                                <Ionicons name="scan-outline" size={16} color={COLORS.textMuted} style={{ marginRight: 6 }} />
+                                <Ionicons name="scan-outline" size={r.isSmall ? 20 : 16} color={COLORS.textMuted} style={{ marginRight: 6 }} />
                                 <TextInput
                                     ref={searchInputRef}
                                     nativeID="product-search-input"
@@ -1959,7 +1959,7 @@ export default function BillingScreen({ navigation, route }) {
                                 />
                                 {searchQuery.length > 0 && (
                                     <TouchableOpacity onPress={() => { setSearchQuery(''); setSearchResults([]); setShowDropdown(false); }}>
-                                        <Ionicons name="close-circle" size={16} color={COLORS.textMuted} />
+                                        <Ionicons name="close-circle" size={r.isSmall ? 20 : 16} color={COLORS.textMuted} />
                                     </TouchableOpacity>
                                 )}
                                 {searchLoading && <ActivityIndicator size="small" color={COLORS.primary} style={{ marginLeft: 4 }} />}
@@ -1967,7 +1967,7 @@ export default function BillingScreen({ navigation, route }) {
 
                             {/* Product Search Dropdown */}
                             {showDropdown && searchResults.length > 0 && (
-                                <View style={erpStyles.dropdownBox}>
+                                <View style={[erpStyles.dropdownBox, r.isSmall && { top: '100%' }]}>
                                     <View style={erpStyles.dropdownHeader}>
                                         <Text style={[erpStyles.dropdownHeaderCol, { flex: 2.5 }]}>MEDICINE NAME</Text>
                                         <Text style={[erpStyles.dropdownHeaderCol, { flex: 1 }]}>BATCH NO</Text>

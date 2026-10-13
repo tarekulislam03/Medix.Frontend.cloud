@@ -29,7 +29,13 @@
       "package": "com.anonymous.medixpos"
     },
     "web": {
-      "favicon": "./assets/medix-app-icon.png"
+      "favicon": "./assets/medix-app-icon.png",
+      "name": "Medix POS",
+      "shortName": "Medix",
+      "themeColor": "#1A3C34",
+      "backgroundColor": "#1A3C34",
+      "display": "standalone",
+      "orientation": "landscape"
     },
     "plugins": [
       [
