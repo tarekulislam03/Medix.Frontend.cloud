@@ -1015,7 +1015,7 @@ export default function BillingScreen({ navigation, route }) {
                     p.barcode === query.trim() ||
                     p.short_barcode === query.trim()
                 );
-                setSearchResults(filtered);
+                setSearchResults(filtered.slice(0, 30));
                 setShowDropdown(true);
                 return;
             }
@@ -1026,7 +1026,7 @@ export default function BillingScreen({ navigation, route }) {
                 try {
                     const response = await searchProducts({ query: query.trim(), type: 'name' });
                     const products = response?.data ?? response?.products ?? response ?? [];
-                    setSearchResults(Array.isArray(products) ? products : []);
+                    setSearchResults(Array.isArray(products) ? products.slice(0, 30) : []);
                     setShowDropdown(true);
                 } catch {
                     setSearchResults([]);
@@ -1034,7 +1034,7 @@ export default function BillingScreen({ navigation, route }) {
                     setSearchLoading(false);
                 }
             })();
-        }, productsLoaded ? 100 : 350);
+        }, 250);
     }, [productsLoaded, allProducts]);
 
     // ─── CART ───────────────────────────────────────
@@ -1136,7 +1136,7 @@ export default function BillingScreen({ navigation, route }) {
             if (list.length === 1) {
                 addToCart(list[0]);
             } else {
-                setSearchResults(list);
+                setSearchResults(list.slice(0, 30));
                 setShowDropdown(true);
             }
             setTimeout(() => searchInputRef.current?.focus(), 50);
@@ -1153,7 +1153,7 @@ export default function BillingScreen({ navigation, route }) {
             if (list.length === 1) {
                 addToCart(list[0]);
             } else {
-                setSearchResults(list);
+                setSearchResults(list.slice(0, 30));
                 setShowDropdown(true);
             }
         } catch {
@@ -1715,6 +1715,40 @@ export default function BillingScreen({ navigation, route }) {
     const getName = (item) => item.medicine_name;
     const getPrice = (item) => item.mrp ?? 0;
 
+    const fefoPriorityIds = useMemo(() => {
+        const fefoMap = {};
+        searchResults.forEach(p => {
+            const stock = p.quantity ?? p.stock ?? 0;
+            if (stock <= 0) return;
+            const name = p.medicine_name || p.name;
+            if (!name) return;
+            if (!fefoMap[name]) fefoMap[name] = [];
+            fefoMap[name].push(p);
+        });
+        const firstIds = new Set();
+        Object.values(fefoMap).forEach(siblings => {
+            if (siblings.length <= 1) return;
+            siblings.sort((a, b) => {
+                const dateA = a.expiry_date || a.expiry;
+                const dateB = b.expiry_date || b.expiry;
+                let diff = 0;
+                if (!dateA && !dateB) diff = 0;
+                else if (!dateA) diff = 1;
+                else if (!dateB) diff = -1;
+                else diff = new Date(dateA) - new Date(dateB);
+                if (diff === 0) {
+                    const idA = (a._id || a.id || '').toString();
+                    const idB = (b._id || b.id || '').toString();
+                    return idA.localeCompare(idB);
+                }
+                return diff;
+            });
+            const firstId = siblings[0]._id || siblings[0].id;
+            if (firstId) firstIds.add(firstId);
+        });
+        return firstIds;
+    }, [searchResults]);
+
 
     // ─── CUSTOMER STRIP: update credit display and clear button ─────────────────────────
     // Helper to clear selected customer and reset credit
@@ -1949,24 +1983,7 @@ export default function BillingScreen({ navigation, route }) {
                                             const expiry = formatExpiryDate(product.expiry_date || product.expiry || 'N/A');
                                             const price = Number(getPrice(product)).toFixed(2);
                                             
-                                            // Identify if this is the FEFO priority batch (first in-stock occurrence by expiry)
-                                            const inStockSiblings = searchResults.filter(p => (p.medicine_name || p.name) === (product.medicine_name || product.name) && (p.quantity ?? p.stock ?? 0) > 0);
-                                            inStockSiblings.sort((a, b) => {
-                                                const dateA = a.expiry_date || a.expiry;
-                                                const dateB = b.expiry_date || b.expiry;
-                                                let diff = 0;
-                                                if (!dateA && !dateB) diff = 0;
-                                                else if (!dateA) diff = 1;
-                                                else if (!dateB) diff = -1;
-                                                else diff = new Date(dateA) - new Date(dateB);
-                                                if (diff === 0) {
-                                                    const idA = (a._id || a.id || '').toString();
-                                                    const idB = (b._id || b.id || '').toString();
-                                                    return idA.localeCompare(idB);
-                                                }
-                                                return diff;
-                                            });
-                                            const isFefoPriority = inStockSiblings.length > 1 && inStockSiblings[0]._id === (product._id || product.id) && !isOutOfStock;
+                                            const isFefoPriority = fefoPriorityIds.has(product._id || product.id) && !isOutOfStock;
                                             return (
                                                 <TouchableOpacity
                                                     key={product._id || product.id || idx}
